@@ -1,0 +1,531 @@
+
+========== AUTH DEPENDENCY ==========
+from typing import Annotated
+
+from fastapi import Depends, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jwt import InvalidTokenError
+from sqlalchemy import select, text
+from sqlalchemy.orm import Session
+
+from app.core.security import decode_access_token, hash_token, parse_user_id
+from app.db.session import get_db
+from app.models.user import User
+from app.models.user_session import UserSession
+from app.services.permission_service import user_has_permission
+
+bearer_scheme = HTTPBearer(auto_error=False)
+DbSession = Annotated[Session, Depends(get_db)]
+
+
+def get_current_user(
+    db: DbSession,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
+) -> User:
+    if credentials is None:
+        raise HTTPException(
+            status_code=401, detail="Authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = credentials.credentials
+    try:
+        claims = decode_access_token(token)
+        user_id = parse_user_id(claims)
+    except InvalidTokenError as exc:
+        raise HTTPException(
+            status_code=401, detail="Invalid or expired access token",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+    # RLS identity must be set in this transaction before protected queries.
+    db.execute(
+        text("SELECT set_config('app.user_id', :user_id, true)"),
+        {"user_id": str(user_id)},
+    )
+    active_session = db.scalar(
+        select(UserSession).where(
+            UserSession.user_id == user_id,
+            UserSession.session_token_hash == hash_token(token),
+            UserSession.revoked_at.is_(None),
+            UserSession.expires_at > text("now()"),
+        )
+    )
+    if active_session is None:
+        raise HTTPException(
+            status_code=401, detail="Session is no longer active",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    user = db.scalar(
+        select(User).where(
+            User.id == user_id,
+            User.company_id == active_session.company_id,
+            User.status == "active",
+            User.deleted_at.is_(None),
+        )
+    )
+    if user is None:
+        raise HTTPException(status_code=401, detail="User is inactive or unavailable")
+    return user
+
+
+CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+def require_permission(permission_code: str):
+    """Check a named permission; RLS must still enforce row and organizational scope."""
+
+    def permission_dependency(db: DbSession, current_user: CurrentUser) -> User:
+        if not user_has_permission(
+            db,
+            user_id=current_user.id,
+            company_id=current_user.company_id,
+            permission_code=permission_code,
+        ):
+            raise HTTPException(status_code=403, detail=f"Permission required: {permission_code}")
+        return current_user
+
+    return permission_dependency
+
+========== AUTH SERVICE INITIALIZATION ==========
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+import hmac
+from uuid import UUID, uuid4
+
+from fastapi import HTTPException, status
+from sqlalchemy import select, text, update
+from sqlalchemy.orm import Session
+
+from app.core.config import settings
+from app.core.security import (
+    create_access_token,
+    create_csrf_token,
+    create_refresh_token,
+    decode_access_token,
+    hash_token,
+    parse_user_id,
+)
+from app.models.company import Company
+from app.models.user import User
+from app.models.user_session import UserSession
+from app.models.user_refresh_token import UserRefreshToken
+from app.schemas.auth import RoleAssignmentRead
+from app.services.audit_service import write_audit_event
+
+# Fallback scope used when user_role_assignments.scope_type is NULL.
+_ROLE_SCOPE: dict[str, str] = {
+    "employee": "self",
+    "support_agent": "team",
+    "team_lead": "team",
+    "department_manager": "department",
+    "company_admin": "company",
+    "system_admin": "system",
+}
+
+
+@dataclass(frozen=True)
+class IssuedAuthTokens:
+    access_token: str
+    access_expires_at: datetime
+    refresh_token: str
+    refresh_expires_at: datetime
+    csrf_token: str
+
+
+def _set_user_context(db: Session, user_id: UUID) -> None:
+    db.execute(
+        text("SELECT set_config('app.user_id', :user_id, true)"),
+        {"user_id": str(user_id)},
+    )
+
+
+def _set_refresh_lookup_context(db: Session, refresh_hash: str) -> None:
+    # RLS exposes only the row whose hash is supplied by the backend for lookup.
+    db.execute(
+        text("SELECT set_config('app.refresh_token_hash', :token_hash, true)"),
+        {"token_hash": refresh_hash},
+    )
+
+
+def _revoke_refresh_family(
+    db: Session,
+    *,
+    family_id: UUID,
+    user_id: UUID,
+    session: UserSession | None,
+    now: datetime,
+) -> None:
+    _set_user_context(db, user_id)
+    db.execute(
+        update(UserRefreshToken)
+        .where(
+            UserRefreshToken.family_id == family_id,
+            UserRefreshToken.user_id == user_id,
+            UserRefreshToken.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+    if session is not None and session.revoked_at is None:
+        session.revoked_at = now
+        write_audit_event(
+            db,
+            company_id=session.company_id,
+            action="auth.refresh_family_revoked",
+            entity_type="user",
+            entity_id=user_id,
+            metadata={"family_id": str(family_id)},
+        )
+
+
+def login(
+    db: Session,
+    *,
+    company_code: str,
+    email: str,
+    password: str,
+    ip_address: str | None,
+    user_agent: str | None,
+) -> tuple[User, IssuedAuthTokens]:
+    # Verify credentials using the narrowly scoped database helper.
+    auth_result = db.execute(
+        text("""
+            SELECT authenticated_user_id, authenticated_company_id
+            FROM public.app_authenticate_user(
+                :company_code,
+                :email,
+                :password
+            )
+        """),
+        {
+            "company_code": company_code,
+            "email": email,
+            "password": password,
+        },
+    ).mappings().first()
+
+    if auth_result is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+        )
+
+    user_id = auth_result["authenticated_user_id"]
+    company_id = auth_result["authenticated_company_id"]
+    _set_user_context(db, user_id)
+
+    result = db.execute(
+        select(User, Company)
+        .join(Company, Company.id == User.company_id)
+        .where(
+
+========== AUTH SERVICE AROUND LINE 452 ==========
+            access_user_id = None
+
+        if access_user_id is not None:
+            _set_user_context(db, access_user_id)
+            access_session = db.scalar(
+                select(UserSession)
+                .where(
+                    UserSession.user_id == access_user_id,
+                    UserSession.session_token_hash == hash_token(access_token),
+                )
+                .with_for_update()
+            )
+            if access_session is not None:
+                if access_session.revoked_at is None:
+                    access_session.revoked_at = now
+                db.execute(
+                    update(UserRefreshToken)
+                    .where(
+                        UserRefreshToken.session_id == access_session.id,
+                        UserRefreshToken.user_id == access_user_id,
+                        UserRefreshToken.revoked_at.is_(None),
+                    )
+                    .values(revoked_at=now)
+                )
+                write_audit_event(
+                    db,
+                    company_id=access_session.company_id,
+                    action="auth.logout",
+                    entity_type="user",
+                    entity_id=access_user_id,
+                )
+
+    db.commit()
+
+
+def get_user_roles(
+    db: Session,
+    *,
+    user_id: UUID,
+    company_id: UUID,
+) -> list[RoleAssignmentRead]:
+    """Return the caller's active role assignments for the /auth/me response."""
+    rows = db.execute(
+        text("""
+            SELECT lower(r.code)        AS role_code,
+                   ura.company_id       AS company_id,
+                   ura.scope_type       AS scope_type,
+                   ura.scope_department_id AS department_id,
+                   ura.scope_team_id    AS team_id
+            FROM public.user_role_assignments ura
+            JOIN public.roles r ON r.id = ura.role_id
+            WHERE ura.user_id    = :user_id
+              AND ura.company_id  = :company_id
+              AND ura.revoked_at  IS NULL
+              AND r.is_active     = TRUE
+            ORDER BY r.code ASC
+        """),
+        {"user_id": user_id, "company_id": company_id},
+    ).mappings().all()
+
+    result: list[RoleAssignmentRead] = []
+    for row in rows:
+        code = str(row["role_code"])
+        scope = str(row["scope_type"]) if row["scope_type"] else _ROLE_SCOPE.get(code, "self")
+        result.append(RoleAssignmentRead(
+            role_code=code,
+            scope=scope,
+            company_id=row["company_id"],
+            department_id=row["department_id"],
+            team_id=row["team_id"],
+        ))
+    return result
+
+========== DATABASE SESSION CONFIGURATION ==========
+from collections.abc import Generator
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from app.core.config import settings
+
+engine = create_engine(
+    settings.database_url, pool_pre_ping=True, pool_size=5, max_overflow=10, pool_recycle=1800
+)
+SessionLocal = sessionmaker(bind=engine, class_=Session, autoflush=False, expire_on_commit=False)
+
+
+def get_db() -> Generator[Session, None, None]:
+    """Create one session per request and roll back if a request fails."""
+    db = SessionLocal()
+    try:
+        yield db
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+========== AUTH API ROUTES ==========
+from datetime import UTC, datetime
+import hmac
+
+from fastapi import APIRouter, HTTPException, Request, Response, status
+
+from app.api.deps import CurrentUser, DbSession
+from app.core.config import settings
+from app.schemas.auth import (
+    LoginRequest,
+    LoginResponse,
+    RefreshResponse,
+    UserMeResponse,
+    UserRead,
+)
+from app.schemas.user import ProfileUpdate
+from app.services.auth_service import (
+    get_user_roles,
+    login,
+    logout_session,
+    rotate_refresh_token,
+)
+from app.services.user_service import update_user_profile
+
+router = APIRouter(prefix="/auth", tags=["authentication"])
+
+
+def _set_refresh_cookies(
+    response: Response,
+    *,
+    refresh_token: str,
+    refresh_expires_at: datetime,
+    csrf_token: str,
+) -> None:
+    max_age = max(0, int((refresh_expires_at - datetime.now(UTC)).total_seconds()))
+    secure = settings.effective_refresh_cookie_secure
+    same_site = settings.refresh_cookie_samesite
+
+    response.set_cookie(
+        key=settings.refresh_cookie_name,
+        value=refresh_token,
+        max_age=max_age,
+        path=settings.refresh_cookie_path,
+        secure=secure,
+        httponly=True,
+        samesite=same_site,
+    )
+    # The CSRF cookie is intentionally readable by the frontend so it can be
+    # echoed in X-CSRF-Token. It is not an authentication credential.
+    response.set_cookie(
+        key=settings.refresh_csrf_cookie_name,
+        value=csrf_token,
+        max_age=max_age,
+        path=settings.refresh_cookie_path,
+        secure=secure,
+        httponly=False,
+        samesite=same_site,
+    )
+
+
+def _clear_refresh_cookies(response: Response) -> None:
+    response.delete_cookie(
+        key=settings.refresh_cookie_name,
+        path=settings.refresh_cookie_path,
+        secure=settings.effective_refresh_cookie_secure,
+        httponly=True,
+        samesite=settings.refresh_cookie_samesite,
+    )
+    response.delete_cookie(
+        key=settings.refresh_csrf_cookie_name,
+        path=settings.refresh_cookie_path,
+        secure=settings.effective_refresh_cookie_secure,
+        httponly=False,
+        samesite=settings.refresh_cookie_samesite,
+    )
+
+
+def _validate_csrf_request(request: Request) -> str:
+    cookie_value = request.cookies.get(settings.refresh_csrf_cookie_name)
+    header_value = request.headers.get("x-csrf-token")
+    if not cookie_value or not header_value or not hmac.compare_digest(cookie_value, header_value):
+        raise HTTPException(status_code=403, detail="CSRF validation failed")
+
+    origin = request.headers.get("origin")
+    allowed_origins = {value.rstrip("/") for value in settings.cors_origin_list}
+    if origin and origin.rstrip("/") not in allowed_origins:
+        raise HTTPException(status_code=403, detail="Request origin is not allowed")
+    if settings.app_env.lower() == "production" and not origin:
+        raise HTTPException(status_code=403, detail="Origin header is required")
+    return header_value
+
+
+def _bearer_token(request: Request) -> str | None:
+    value = request.headers.get("authorization", "")
+    scheme, _, credentials = value.partition(" ")
+    if scheme.lower() != "bearer" or not credentials.strip():
+        return None
+    return credentials.strip()
+
+
+@router.post("/login", response_model=LoginResponse)
+def login_route(
+    payload: LoginRequest,
+    request: Request,
+    response: Response,
+    db: DbSession,
+) -> LoginResponse:
+    user, tokens = login(
+        db,
+        company_code=payload.company_code,
+        email=str(payload.email),
+        password=payload.password,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    _set_refresh_cookies(
+        response,
+        refresh_token=tokens.refresh_token,
+        refresh_expires_at=tokens.refresh_expires_at,
+        csrf_token=tokens.csrf_token,
+    )
+    return LoginResponse(
+        access_token=tokens.access_token,
+        expires_in_seconds=max(
+            0, int((tokens.access_expires_at - datetime.now(UTC)).total_seconds())
+        ),
+        csrf_token=tokens.csrf_token,
+        user=UserRead.model_validate(user),
+    )
+
+
+@router.post("/refresh", response_model=RefreshResponse)
+def refresh_route(request: Request, response: Response, db: DbSession) -> RefreshResponse:
+    refresh_token = request.cookies.get(settings.refresh_cookie_name)
+    if not refresh_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh session is missing",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    csrf_token = _validate_csrf_request(request)
+    tokens = rotate_refresh_token(
+        db,
+        refresh_token=refresh_token,
+        csrf_token=csrf_token,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+    )
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    _set_refresh_cookies(
+        response,
+        refresh_token=tokens.refresh_token,
+        refresh_expires_at=tokens.refresh_expires_at,
+        csrf_token=tokens.csrf_token,
+    )
+    return RefreshResponse(
+        access_token=tokens.access_token,
+        expires_in_seconds=max(
+            0, int((tokens.access_expires_at - datetime.now(UTC)).total_seconds())
+        ),
+        csrf_token=tokens.csrf_token,
+    )
+
+
+@router.get("/me", response_model=UserMeResponse)
+def read_current_user(current_user: CurrentUser, db: DbSession) -> UserMeResponse:
+    roles = get_user_roles(db, user_id=current_user.id, company_id=current_user.company_id)
+    return UserMeResponse(
+        id=current_user.id,
+        company_id=current_user.company_id,
+        first_name=current_user.first_name,
+        last_name=current_user.last_name,
+        email=current_user.email,
+        department_id=current_user.department_id,
+        status=current_user.status,
+        roles=roles,
+    )
+
+
+@router.patch("/me", response_model=UserMeResponse)
+def update_profile(payload: ProfileUpdate, current_user: CurrentUser, db: DbSession) -> UserMeResponse:
+    updated = update_user_profile(db, current_user=current_user, payload=payload)
+    roles = get_user_roles(db, user_id=updated.id, company_id=updated.company_id)
+    return UserMeResponse(
+        id=updated.id,
+        company_id=updated.company_id,
+        first_name=updated.first_name,
+        last_name=updated.last_name,
+        email=updated.email,
+        department_id=updated.department_id,
+        status=updated.status,
+        roles=roles,
+    )
+
+
+@router.post("/logout", status_code=204)
+def logout_route(request: Request, response: Response, db: DbSession) -> None:
+    refresh_token = request.cookies.get(settings.refresh_cookie_name)
+    csrf_token = _validate_csrf_request(request) if refresh_token else None
+    logout_session(
+        db,
+        access_token=_bearer_token(request),
+        refresh_token=refresh_token,
+        csrf_token=csrf_token,
+    )
+    _clear_refresh_cookies(response)
